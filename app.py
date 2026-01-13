@@ -1,23 +1,22 @@
 # app.py
 # Streamlit app: crossing start-location heatmaps on a 105x68 pitch
 #
-# Run:
+# How to run:
 #   pip install streamlit pandas numpy matplotlib scipy
 #   streamlit run app.py
 #
-# Notes:
+# Assumptions about your data (from our earlier work):
 # - Cross events are identified by either:
-#     * boolean/int column `is_cross` == 1, OR
-#     * `action` containing "cross" (case-insensitive)
-# - Start locations are read from `start_adj_x`, `start_adj_y`
-# - AUTO coordinate handling:
-#     If data looks like a 52.5x34-centered system (roughly +/-52.5, +/-34),
-#     we apply Option 2 conversion:
-#         x_105 = start_adj_x + 52.5
-#         y_68  = 34 - start_adj_y
-#     Otherwise we assume it's already 0..105 / 0..68 and use as-is.
-# - Heatmap is drawn FIRST, then pitch lines are drawn ON TOP.
+#     - a boolean column `is_cross` (1/0), OR
+#     - `action` containing the word "cross" (case-insensitive)
+# - Start locations are in `start_adj_x`, `start_adj_y`
+# - Those start coords were originally based on a 52.5x34 system.
+#   We convert to 105x68 using the "Option 2" mapping you validated earlier:
+#       x_105 = start_adj_x + 52.5
+#       y_68  = 34 - start_adj_y
 #
+# If your dataset uses different column names, edit the constants near the top.
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -34,7 +33,7 @@ except Exception:
 # -----------------------------
 COL_TEAM = "team_name"
 COL_PLAYER = "player_id"
-COL_PLAYER_NAME = "player_name"  # optional; falls back to player_id
+COL_PLAYER_NAME = "player_name"  # optional; app falls back to player_id if missing
 COL_ACTION = "action"
 COL_IS_CROSS = "is_cross"
 
@@ -61,11 +60,13 @@ def is_cross_row(df: pd.DataFrame) -> pd.Series:
         return df[COL_IS_CROSS].fillna(0).astype(int) == 1
     if COL_ACTION in df.columns:
         return df[COL_ACTION].fillna("").str.contains("cross", case=False, na=False)
+    # fallback: nothing
     return pd.Series([False] * len(df), index=df.index)
 
 
 def draw_pitch(ax: plt.Axes, show_grid: bool = True) -> None:
     """Draw a standard 105x68 football pitch (top-down)."""
+    # Background
     ax.set_facecolor("white")
 
     # Outer boundaries
@@ -118,6 +119,7 @@ def draw_pitch(ax: plt.Axes, show_grid: bool = True) -> None:
     ax.plot(PITCH_LENGTH - 11, PITCH_WIDTH / 2, marker="o", color="black", ms=3)
 
     # Penalty arcs (outside the box)
+    # Left arc: x = 16.5 + sqrt(r^2 - (y-34)^2)
     r = 9.15
     yy = np.linspace((PITCH_WIDTH / 2) - r, (PITCH_WIDTH / 2) + r, 300)
     xx_left = box_d + np.sqrt(np.maximum(0, r**2 - (yy - (PITCH_WIDTH / 2)) ** 2))
@@ -140,10 +142,11 @@ def draw_pitch(ax: plt.Axes, show_grid: bool = True) -> None:
 
 def plot_heatmap(ax: plt.Axes, x: np.ndarray, y: np.ndarray, method: str, bins: int = 24) -> None:
     """Overlay a heatmap of start locations on the pitch."""
-    if len(x) == 0 or len(y) == 0:
+    if len(x) == 0:
         return
 
     if method == "KDE (smooth)" and SCIPY_OK and len(np.unique(np.vstack([x, y]).T, axis=0)) >= 3:
+        # KDE on a grid
         xi, yi = np.mgrid[0:PITCH_LENGTH:300j, 0:PITCH_WIDTH:300j]
         vals = np.vstack([x, y])
 
@@ -154,10 +157,12 @@ def plot_heatmap(ax: plt.Axes, x: np.ndarray, y: np.ndarray, method: str, bins: 
             ax.contour(xi, yi, zi, levels=8, colors="white", linewidths=0.8, alpha=0.5)
             return
         except Exception:
+            # fallback to histogram below
             pass
 
-    # Histogram fallback (always works)
-    H, _, _ = np.histogram2d(x, y, bins=[bins, bins], range=[[0, PITCH_LENGTH], [0, PITCH_WIDTH]])
+    # Histogram heatmap (always works)
+    H, xedges, yedges = np.histogram2d(x, y, bins=[bins, bins], range=[[0, PITCH_LENGTH], [0, PITCH_WIDTH]])
+    # Transpose to match x/y axes
     ax.imshow(
         H.T,
         origin="lower",
@@ -172,7 +177,7 @@ def plot_heatmap(ax: plt.Axes, x: np.ndarray, y: np.ndarray, method: str, bins: 
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="Cross Start Heatmaps", layout="wide")
-st.title("Cross Start-Location Heatmaps")
+st.title("Cross Start-Location Heatmaps (Manchester United Women)")
 
 uploaded = st.file_uploader("Upload your event CSV", type=["csv"])
 if uploaded is None:
@@ -181,12 +186,14 @@ if uploaded is None:
 
 df = pd.read_csv(uploaded)
 
+# Basic checks
 missing = [c for c in [COL_TEAM, COL_PLAYER, COL_SX, COL_SY] if c not in df.columns]
 if missing:
     st.error(f"Missing required columns: {missing}")
     st.write("Columns found:", list(df.columns))
     st.stop()
 
+# Filter team
 teams = sorted(df[COL_TEAM].dropna().unique().tolist())
 default_team = "Manchester United Women" if "Manchester United Women" in teams else (teams[0] if teams else None)
 team = st.selectbox("Team", teams, index=teams.index(default_team) if default_team in teams else 0)
@@ -198,7 +205,9 @@ if team_df.empty:
     st.warning("No crosses found for this team with the current cross-identification rules.")
     st.stop()
 
+# Player selection
 if COL_PLAYER_NAME in team_df.columns:
+    # nice label
     team_df["_player_label"] = team_df[COL_PLAYER_NAME].fillna(team_df[COL_PLAYER].astype(str))
 else:
     team_df["_player_label"] = team_df[COL_PLAYER].astype(str)
@@ -209,45 +218,27 @@ player_label = st.selectbox("Player", player_labels)
 p_df = team_df[team_df["_player_label"] == player_label].copy()
 
 st.sidebar.header("Heatmap settings")
-heatmap_method_options = []
-if SCIPY_OK:
-    heatmap_method_options.append("KDE (smooth)")
-heatmap_method_options.append("Histogram (binned)")
-method = st.sidebar.selectbox("Heatmap method", heatmap_method_options, index=0)
-bins = st.sidebar.slider("Histogram bins", 10, 50, 24, 1)
+method = st.sidebar.selectbox("Heatmap method", ["KDE (smooth)" if SCIPY_OK else "Histogram (binned)", "Histogram (binned)"])
+bins = st.sidebar.slider("Histogram bins (if using histogram)", 10, 50, 24, 1)
 show_grid = st.sidebar.checkbox("Show pitch grid", value=True)
 
-# ---- AUTO coordinate handling ----
-raw_x = pd.to_numeric(p_df[COL_SX], errors="coerce")
-raw_y = pd.to_numeric(p_df[COL_SY], errors="coerce")
-valid = raw_x.notna() & raw_y.notna()
-raw_x = raw_x[valid]
-raw_y = raw_y[valid]
+st.sidebar.header("Coordinate conversion")
+st.sidebar.write("Your starts are assumed to be from 52.5×34. Using Option 2 conversion.")
+# (If needed later, you can add alternate conversions/toggles)
 
-if raw_x.empty:
-    st.error("No valid numeric start coordinates found after filtering.")
-    st.stop()
-
-# If values look centered around 0 (~52.5x34 system), apply Option 2; otherwise assume already standard
-if raw_x.abs().max() <= 60 and raw_y.abs().max() <= 40:
-    x = raw_x + 52.5
-    y = 34.0 - raw_y
-else:
-    x = raw_x
-    y = raw_y
-
+# Convert coordinates to 105x68
+x, y = to_105x68_option2(p_df[COL_SX].astype(float), p_df[COL_SY].astype(float))
+# Clip safely
 x = x.clip(0, PITCH_LENGTH).to_numpy()
 y = y.clip(0, PITCH_WIDTH).to_numpy()
 
-# Debug range readout so you can verify
-st.caption(f"Start-x range: {x.min():.2f}–{x.max():.2f} | Start-y range: {y.min():.2f}–{y.max():.2f} | n={len(x)}")
-
-# ---- Plot: heatmap first, then pitch lines on top ----
+# Plot
 fig, ax = plt.subplots(figsize=(10, 6))
-plot_heatmap(ax, x, y, method=method, bins=bins)
 draw_pitch(ax, show_grid=show_grid)
+plot_heatmap(ax, x, y, method=method, bins=bins)
 
 ax.set_title(f"{team} — {player_label}\nCross start locations (n={len(p_df)})", fontsize=14)
+
 st.pyplot(fig, clear_figure=True)
 
 with st.expander("Show filtered data (crosses only)"):
