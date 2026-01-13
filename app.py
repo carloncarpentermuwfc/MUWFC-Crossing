@@ -1,245 +1,472 @@
-# app.py
-# Streamlit app: crossing start-location heatmaps on a 105x68 pitch
-#
-# How to run:
-#   pip install streamlit pandas numpy matplotlib scipy
-#   streamlit run app.py
-#
-# Assumptions about your data (from our earlier work):
-# - Cross events are identified by either:
-#     - a boolean column `is_cross` (1/0), OR
-#     - `action` containing the word "cross" (case-insensitive)
-# - Start locations are in `start_adj_x`, `start_adj_y`
-# - Those start coords were originally based on a 52.5x34 system.
-#   We convert to 105x68 using the "Option 2" mapping you validated earlier:
-#       x_105 = start_adj_x + 52.5
-#       y_68  = 34 - start_adj_y
-#
-# If your dataset uses different column names, edit the constants near the top.
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
-try:
-    from scipy.stats import gaussian_kde
-    SCIPY_OK = True
-except Exception:
-    SCIPY_OK = False
-
-# -----------------------------
-# Config: column names
-# -----------------------------
-COL_TEAM = "team_name"
-COL_PLAYER = "player_id"
-COL_PLAYER_NAME = "player_name"  # optional; app falls back to player_id if missing
-COL_ACTION = "action"
-COL_IS_CROSS = "is_cross"
-
-COL_SX = "start_adj_x"
-COL_SY = "start_adj_y"
-
-PITCH_LENGTH = 105.0
-PITCH_WIDTH = 68.0
+st.set_page_config(page_title="Crossing Dashboard", layout="wide")
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def to_105x68_option2(x_52_5: pd.Series, y_34: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """Convert from 52.5x34-centered system to a 105x68 pitch (Option 2)."""
-    x = x_52_5 + 52.5
-    y = 34.0 - y_34
-    return x, y
+# ----------------------------
+# Data + helpers
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def load_csv(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
 
 
-def is_cross_row(df: pd.DataFrame) -> pd.Series:
-    """Identify crosses using is_cross if present, otherwise action contains 'cross'."""
-    if COL_IS_CROSS in df.columns:
-        return df[COL_IS_CROSS].fillna(0).astype(int) == 1
-    if COL_ACTION in df.columns:
-        return df[COL_ACTION].fillna("").str.contains("cross", case=False, na=False)
-    # fallback: nothing
-    return pd.Series([False] * len(df), index=df.index)
+def build_pitch_shapes_vertical(length=120, width=80):
+    """Vertical pitch (attack up): x axis = width (0..80), y axis = length (0..120)"""
+    shapes = []
+    shapes.append(dict(type="rect", x0=0, y0=0, x1=width, y1=length, line=dict(width=2)))
+    shapes.append(dict(type="line", x0=0, y0=length / 2, x1=width, y1=length / 2, line=dict(width=2)))
+
+    pa_y = 18
+    pa_x0, pa_x1 = 18, 62
+    shapes.append(dict(type="rect", x0=pa_x0, y0=0, x1=pa_x1, y1=pa_y, line=dict(width=2)))
+    shapes.append(dict(type="rect", x0=pa_x0, y0=length - pa_y, x1=pa_x1, y1=length, line=dict(width=2)))
+
+    sb_y = 6
+    sb_x0, sb_x1 = 30, 50
+    shapes.append(dict(type="rect", x0=sb_x0, y0=0, x1=sb_x1, y1=sb_y, line=dict(width=2)))
+    shapes.append(dict(type="rect", x0=sb_x0, y0=length - sb_y, x1=sb_x1, y1=length, line=dict(width=2)))
+
+    shapes.append(
+        dict(
+            type="circle",
+            x0=width / 2 - 10,
+            y0=length / 2 - 10,
+            x1=width / 2 + 10,
+            y1=length / 2 + 10,
+            line=dict(width=2),
+        )
+    )
+    return shapes
 
 
-def draw_pitch(ax: plt.Axes, show_grid: bool = True) -> None:
-    """Draw a standard 105x68 football pitch (top-down)."""
-    # Background
-    ax.set_facecolor("white")
-
-    # Outer boundaries
-    ax.plot([0, PITCH_LENGTH], [0, 0], color="black", lw=1.5)
-    ax.plot([0, PITCH_LENGTH], [PITCH_WIDTH, PITCH_WIDTH], color="black", lw=1.5)
-    ax.plot([0, 0], [0, PITCH_WIDTH], color="black", lw=1.5)
-    ax.plot([PITCH_LENGTH, PITCH_LENGTH], [0, PITCH_WIDTH], color="black", lw=1.5)
-
-    # Halfway line
-    ax.plot([PITCH_LENGTH / 2, PITCH_LENGTH / 2], [0, PITCH_WIDTH], color="black", lw=1.5)
-
-    # Centre circle + spot
-    centre = (PITCH_LENGTH / 2, PITCH_WIDTH / 2)
-    cc = plt.Circle(centre, 9.15, fill=False, color="black", lw=1.2)
-    ax.add_patch(cc)
-    ax.plot(centre[0], centre[1], marker="o", color="black", ms=3)
-
-    # Penalty areas (16.5m deep, 40.32m wide)
-    box_w = 40.32
-    box_d = 16.5
-    y0 = (PITCH_WIDTH - box_w) / 2
-
-    # Left penalty area
-    ax.plot([0, box_d], [y0, y0], color="black", lw=1.2)
-    ax.plot([0, box_d], [y0 + box_w, y0 + box_w], color="black", lw=1.2)
-    ax.plot([box_d, box_d], [y0, y0 + box_w], color="black", lw=1.2)
-
-    # Right penalty area
-    ax.plot([PITCH_LENGTH, PITCH_LENGTH - box_d], [y0, y0], color="black", lw=1.2)
-    ax.plot([PITCH_LENGTH, PITCH_LENGTH - box_d], [y0 + box_w, y0 + box_w], color="black", lw=1.2)
-    ax.plot([PITCH_LENGTH - box_d, PITCH_LENGTH - box_d], [y0, y0 + box_w], color="black", lw=1.2)
-
-    # 6-yard boxes (5.5m deep, 18.32m wide)
-    six_w = 18.32
-    six_d = 5.5
-    y1 = (PITCH_WIDTH - six_w) / 2
-
-    # Left 6-yard
-    ax.plot([0, six_d], [y1, y1], color="black", lw=1.0)
-    ax.plot([0, six_d], [y1 + six_w, y1 + six_w], color="black", lw=1.0)
-    ax.plot([six_d, six_d], [y1, y1 + six_w], color="black", lw=1.0)
-
-    # Right 6-yard
-    ax.plot([PITCH_LENGTH, PITCH_LENGTH - six_d], [y1, y1], color="black", lw=1.0)
-    ax.plot([PITCH_LENGTH, PITCH_LENGTH - six_d], [y1 + six_w, y1 + six_w], color="black", lw=1.0)
-    ax.plot([PITCH_LENGTH - six_d, PITCH_LENGTH - six_d], [y1, y1 + six_w], color="black", lw=1.0)
-
-    # Penalty spots
-    ax.plot(11, PITCH_WIDTH / 2, marker="o", color="black", ms=3)
-    ax.plot(PITCH_LENGTH - 11, PITCH_WIDTH / 2, marker="o", color="black", ms=3)
-
-    # Penalty arcs (outside the box)
-    # Left arc: x = 16.5 + sqrt(r^2 - (y-34)^2)
-    r = 9.15
-    yy = np.linspace((PITCH_WIDTH / 2) - r, (PITCH_WIDTH / 2) + r, 300)
-    xx_left = box_d + np.sqrt(np.maximum(0, r**2 - (yy - (PITCH_WIDTH / 2)) ** 2))
-    xx_right = (PITCH_LENGTH - box_d) - np.sqrt(np.maximum(0, r**2 - (yy - (PITCH_WIDTH / 2)) ** 2))
-    ax.plot(xx_left, yy, color="black", lw=1.0)
-    ax.plot(xx_right, yy, color="black", lw=1.0)
-
-    # Optional grid
-    if show_grid:
-        for gx in np.arange(0, PITCH_LENGTH + 0.1, 10):
-            ax.plot([gx, gx], [0, PITCH_WIDTH], color="lightgray", lw=0.6, ls="--", alpha=0.4)
-        for gy in np.arange(0, PITCH_WIDTH + 0.1, 10):
-            ax.plot([0, PITCH_LENGTH], [gy, gy], color="lightgray", lw=0.6, ls="--", alpha=0.4)
-
-    ax.set_xlim(0, PITCH_LENGTH)
-    ax.set_ylim(0, PITCH_WIDTH)
-    ax.set_aspect("equal")
-    ax.axis("off")
-
-
-def plot_heatmap(ax: plt.Axes, x: np.ndarray, y: np.ndarray, method: str, bins: int = 24) -> None:
-    """Overlay a heatmap of start locations on the pitch."""
-    if len(x) == 0:
-        return
-
-    if method == "KDE (smooth)" and SCIPY_OK and len(np.unique(np.vstack([x, y]).T, axis=0)) >= 3:
-        # KDE on a grid
-        xi, yi = np.mgrid[0:PITCH_LENGTH:300j, 0:PITCH_WIDTH:300j]
-        vals = np.vstack([x, y])
-
-        try:
-            kde = gaussian_kde(vals, bw_method=0.35)
-            zi = kde(np.vstack([xi.flatten(), yi.flatten()])).reshape(xi.shape)
-            ax.contourf(xi, yi, zi, levels=20, cmap="YlOrRd", alpha=0.6)
-            ax.contour(xi, yi, zi, levels=8, colors="white", linewidths=0.8, alpha=0.5)
-            return
-        except Exception:
-            # fallback to histogram below
-            pass
-
-    # Histogram heatmap (always works)
-    H, xedges, yedges = np.histogram2d(x, y, bins=[bins, bins], range=[[0, PITCH_LENGTH], [0, PITCH_WIDTH]])
-    # Transpose to match x/y axes
-    ax.imshow(
-        H.T,
-        origin="lower",
-        extent=[0, PITCH_LENGTH, 0, PITCH_WIDTH],
-        cmap="YlOrRd",
-        alpha=0.6,
-        aspect="auto",
+def make_segment_trace(x0, y0, x1, y1, color: str):
+    """Many line segments separated by NaN."""
+    xs = np.column_stack([x0, x1, np.full_like(x0, np.nan)]).ravel()
+    ys = np.column_stack([y0, y1, np.full_like(y0, np.nan)]).ravel()
+    return go.Scattergl(
+        x=xs,
+        y=ys,
+        mode="lines",
+        line=dict(width=2, color=color),
+        hoverinfo="skip",
+        showlegend=False,
     )
 
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Cross Start Heatmaps", layout="wide")
-st.title("Cross Start-Location Heatmaps (Manchester United Women)")
+def classify_zone(start_x: float, start_y: float) -> str:
+    """
+    Start-zone classification (approximate to your diagram), using StatsBomb coords:
+      X 0..120 (length), Y 0..80 (width)
 
-uploaded = st.file_uploader("Upload your event CSV", type=["csv"])
-if uploaded is None:
-    st.info("Upload a CSV to begin.")
-    st.stop()
+    NOTE: This is symmetric across width, so it still works whether width is inverted or not.
+    """
+    if start_x < 80:
+        return "Other"
 
-df = pd.read_csv(uploaded)
+    wide = (start_y <= 20) or (start_y >= 60)
+    halfspace = ((20 < start_y <= 34) or (46 <= start_y < 60))
 
-# Basic checks
-missing = [c for c in [COL_TEAM, COL_PLAYER, COL_SX, COL_SY] if c not in df.columns]
-if missing:
-    st.error(f"Missing required columns: {missing}")
-    st.write("Columns found:", list(df.columns))
-    st.stop()
+    if wide and start_x >= 114:
+        return "Cutbacks & stand ups"
+    if wide and 108 <= start_x < 114:
+        return "Driven"
+    if wide and 96 <= start_x < 108:
+        return "Whipped"
+    if halfspace and 84 <= start_x < 108:
+        return "Diagonals"
 
-# Filter team
-teams = sorted(df[COL_TEAM].dropna().unique().tolist())
-default_team = "Manchester United Women" if "Manchester United Women" in teams else (teams[0] if teams else None)
-team = st.selectbox("Team", teams, index=teams.index(default_team) if default_team in teams else 0)
+    return "Other"
 
-team_df = df[df[COL_TEAM] == team].copy()
-team_df = team_df[is_cross_row(team_df)].copy()
 
-if team_df.empty:
-    st.warning("No crosses found for this team with the current cross-identification rules.")
-    st.stop()
+def add_zone_overlays(fig: go.Figure, attack_up: bool, flip_len: bool, invert_width: bool):
+    """
+    Translucent start-zone overlays for visual reference.
 
-# Player selection
-if COL_PLAYER_NAME in team_df.columns:
-    # nice label
-    team_df["_player_label"] = team_df[COL_PLAYER_NAME].fillna(team_df[COL_PLAYER].astype(str))
+    We draw in *plot coordinates*, which depend on:
+      - attack_up: vertical vs horizontal view
+      - flip_len: mirroring length (X)
+      - invert_width: mirroring width (Y)
+    """
+    def maybe_flip_x(x):
+        return 120 - x if flip_len else x
+
+    def width_map(y):
+        # plot width coordinate
+        return 80 - y if invert_width else y
+
+    def rect(xmin, xmax, ymin, ymax):
+        x0, x1 = maybe_flip_x(xmin), maybe_flip_x(xmax)
+        x_low, x_high = (min(x0, x1), max(x0, x1))
+
+        wy0 = width_map(ymin)
+        wy1 = width_map(ymax)
+        w_low, w_high = (min(wy0, wy1), max(wy0, wy1))
+
+        if attack_up:
+            # plot coords: x = width_map(Y), y = X
+            return dict(
+                type="rect",
+                x0=w_low,
+                x1=w_high,
+                y0=x_low,
+                y1=x_high,
+                line=dict(width=1, dash="dot"),
+                opacity=0.15,
+            )
+        else:
+            # plot coords: x = X, y = width_map(Y)
+            return dict(
+                type="rect",
+                x0=x_low,
+                x1=x_high,
+                y0=w_low,
+                y1=w_high,
+                line=dict(width=1, dash="dot"),
+                opacity=0.15,
+            )
+
+    # Diagonals (half-spaces)
+    fig.add_shape(rect(84, 108, 20, 34))
+    fig.add_shape(rect(84, 108, 46, 60))
+    # Whipped (wide)
+    fig.add_shape(rect(96, 108, 0, 20))
+    fig.add_shape(rect(96, 108, 60, 80))
+    # Driven (wide, closer)
+    fig.add_shape(rect(108, 114, 0, 20))
+    fig.add_shape(rect(108, 114, 60, 80))
+    # Cutbacks & stand ups (very close)
+    fig.add_shape(rect(114, 120, 0, 20))
+    fig.add_shape(rect(114, 120, 60, 80))
+
+
+# ----------------------------
+# App
+# ----------------------------
+st.title("Crossing Dashboard (Rechecked Coords + Width Fix)")
+
+left, right = st.columns([1, 2], vertical_alignment="top")
+
+with left:
+    st.subheader("Data")
+    uploaded = st.file_uploader("Upload Events CSV (optional)", type=["csv"])
+    default_path = "Events.csv"
+
+    if uploaded is not None:
+        df = pd.read_csv(uploaded)
+        st.caption("Using uploaded file.")
+    else:
+        try:
+            df = load_csv(default_path)
+            st.caption(f"Using local file: {default_path}")
+        except Exception:
+            st.error("No file uploaded and Events.csv not found. Please upload your CSV.")
+            st.stop()
+
+    required_cols = ["Start X", "Start Y", "End X", "End Y"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        st.error(f"Missing required columns: {missing}")
+        st.stop()
+
+    st.subheader("Filters")
+
+    # Team filter
+    teams = sorted(df["Team"].dropna().unique()) if "Team" in df.columns else []
+    team = None
+    if teams:
+        default_team = "Manchester United" if "Manchester United" in teams else teams[0]
+        team = st.selectbox("Team", teams, index=teams.index(default_team))
+
+    # Cross height
+    pass_heights = sorted(df["Pass height"].dropna().unique()) if "Pass height" in df.columns else []
+    selected_heights = None
+    if pass_heights:
+        height_mode = st.radio("Cross height", ["All", "High only", "Low + Ground only", "Custom"], index=0)
+        if height_mode == "Custom":
+            selected_heights = st.multiselect("Select heights", pass_heights, default=pass_heights)
+        elif height_mode == "High only":
+            selected_heights = ["high"] if "high" in pass_heights else pass_heights[:1]
+        elif height_mode == "Low + Ground only":
+            selected_heights = [h for h in ["low", "ground"] if h in pass_heights] or pass_heights
+        else:
+            selected_heights = pass_heights
+
+    # Outcome / Match / Player
+    outcomes = sorted(df["Outcome"].dropna().unique()) if "Outcome" in df.columns else []
+    selected_outcomes = st.multiselect("Outcome", outcomes, default=outcomes) if outcomes else None
+
+    matches = sorted(df["Match"].dropna().unique()) if "Match" in df.columns else []
+    selected_matches = st.multiselect("Match", matches, default=matches) if matches else None
+
+    players = sorted(df["Player"].dropna().unique()) if "Player" in df.columns else []
+    selected_players = st.multiselect("Player", players, default=players) if players else None
+
+    # View options
+    st.subheader("View options")
+    attack_up = st.toggle("Attack upwards (rotate pitch)", value=True)
+    flip_direction = st.toggle(
+        "Flip direction (length)",
+        value=False,
+        help="Mirrors pitch length (X). Use if the team is attacking the opposite end in your data.",
+    )
+
+    # NEW: width inversion toggle (this fixes “some crosses look flipped”)
+    invert_width = st.toggle(
+        "Invert width (fix left/right)",
+        value=True,
+        help="If crosses appear on the wrong side of the pitch, toggle this.",
+    )
+
+    show_zone_overlays = st.toggle("Show start-zone overlays", value=True)
+    show_endpoints = st.toggle("Show endpoints", value=False)
+    show_table = st.toggle("Show data table", value=True)
+
+    # Start zone filter
+    st.subheader("Start zone filter")
+    zone_options = ["Diagonals", "Whipped", "Driven", "Cutbacks & stand ups", "Other"]
+    selected_zones = st.multiselect(
+        "Start Zones",
+        zone_options,
+        default=["Diagonals", "Whipped", "Driven", "Cutbacks & stand ups"],
+    )
+
+    # Start side filter (computed from what you SEE on screen, not raw Y)
+    st.subheader("Start side filter")
+    side_choice = st.radio("Crosses delivered from", ["Both", "Left", "Right"], index=0, horizontal=True)
+
+    # End location filters
+    st.subheader("End location filters")
+    use_end_filters = st.toggle("Enable end-location filtering", value=False)
+    end_x_range = (0.0, 120.0)
+    end_y_range = (0.0, 80.0)
+    in_box_only = False
+    if use_end_filters:
+        end_x_range = st.slider("End X range (0–120)", 0.0, 120.0, (0.0, 120.0), 1.0)
+        end_y_range = st.slider("End Y range (0–80)", 0.0, 80.0, (0.0, 80.0), 1.0)
+        in_box_only = st.toggle("End location inside penalty area only", value=False)
+
+
+# ----------------------------
+# Apply filters
+# ----------------------------
+f = df.copy()
+
+if team and "Team" in f.columns:
+    f = f[f["Team"] == team]
+
+# All rows are crosses per your data
+
+if selected_heights is not None and "Pass height" in f.columns:
+    f = f[f["Pass height"].isin(selected_heights)]
+
+if selected_outcomes is not None and "Outcome" in f.columns:
+    f = f[f["Outcome"].isin(selected_outcomes)]
+
+if selected_matches is not None and "Match" in f.columns:
+    f = f[f["Match"].isin(selected_matches)]
+
+if selected_players is not None and "Player" in f.columns:
+    f = f[f["Player"].isin(selected_players)]
+
+f = f.dropna(subset=["Start X", "Start Y", "End X", "End Y"]).copy()
+
+# Flip length for plotting + zone assignment if requested
+if flip_direction:
+    f["_sx"] = 120 - f["Start X"]
+    f["_ex"] = 120 - f["End X"]
 else:
-    team_df["_player_label"] = team_df[COL_PLAYER].astype(str)
+    f["_sx"] = f["Start X"]
+    f["_ex"] = f["End X"]
 
-player_labels = sorted(team_df["_player_label"].unique().tolist())
-player_label = st.selectbox("Player", player_labels)
+f["_sy"] = f["Start Y"]
+f["_ey"] = f["End Y"]
 
-p_df = team_df[team_df["_player_label"] == player_label].copy()
+# Width mapping for plotting and for “left/right” filter
+def width_map(arr):
+    return 80 - arr if invert_width else arr
 
-st.sidebar.header("Heatmap settings")
-method = st.sidebar.selectbox("Heatmap method", ["KDE (smooth)" if SCIPY_OK else "Histogram (binned)", "Histogram (binned)"])
-bins = st.sidebar.slider("Histogram bins (if using histogram)", 10, 50, 24, 1)
-show_grid = st.sidebar.checkbox("Show pitch grid", value=True)
+f["_sy_plot"] = width_map(f["_sy"].to_numpy())
+f["_ey_plot"] = width_map(f["_ey"].to_numpy())
 
-st.sidebar.header("Coordinate conversion")
-st.sidebar.write("Your starts are assumed to be from 52.5×34. Using Option 2 conversion.")
-# (If needed later, you can add alternate conversions/toggles)
+# Start zone assignment (uses START in length-flipped coords; width inversion doesn't matter for these symmetric rules)
+f["Start Zone"] = [
+    classify_zone(x, y) for x, y in zip(f["_sx"].to_numpy(), f["_sy"].to_numpy())
+]
 
-# Convert coordinates to 105x68
-x, y = to_105x68_option2(p_df[COL_SX].astype(float), p_df[COL_SY].astype(float))
-# Clip safely
-x = x.clip(0, PITCH_LENGTH).to_numpy()
-y = y.clip(0, PITCH_WIDTH).to_numpy()
+# Apply start zone filter
+if selected_zones:
+    f = f[f["Start Zone"].isin(selected_zones)]
+else:
+    f = f.iloc[0:0]
 
+# Start side assignment based on what you see (after width_map)
+# Left side = x < 40 in plot-width space
+f["Start Side"] = np.where(width_map(f["Start Y"].to_numpy()) < 40, "Left", "Right")
+
+# Apply start side filter
+if side_choice != "Both":
+    f = f[f["Start Side"] == side_choice]
+
+# Apply end location filter (in length-flipped coords; width inversion applied via raw _ey later)
+if use_end_filters and len(f) > 0:
+    # We filter on the “data coordinate frame” (after length flip, before width inversion)
+    f = f[
+        (f["_ex"].between(end_x_range[0], end_x_range[1]))
+        & (f["_ey"].between(end_y_range[0], end_y_range[1]))
+    ]
+    if in_box_only:
+        f = f[(f["_ex"] >= 102) & (f["_ey"].between(18, 62))]
+
+# Success flag
+if "Outcome" in f.columns:
+    success = f["Outcome"].astype(str).str.lower().eq("complete").to_numpy()
+else:
+    success = np.zeros(len(f), dtype=bool)
+
+# ----------------------------
+# Coordinates for plotting
+# - attack_up: x = width_map(Y), y = X
+# - else:      x = X, y = width_map(Y)
+# ----------------------------
+pitch_len, pitch_wid = 120, 80
+
+plot_start_x = f["_sx"].to_numpy()
+plot_end_x = f["_ex"].to_numpy()
+
+plot_start_w = width_map(f["_sy"].to_numpy())
+plot_end_w = width_map(f["_ey"].to_numpy())
+
+if attack_up:
+    sx, sy = plot_start_w, plot_start_x
+    ex, ey = plot_end_w, plot_end_x
+    x_range, y_range = (0, pitch_wid), (0, pitch_len)
+else:
+    sx, sy = plot_start_x, plot_start_w
+    ex, ey = plot_end_x, plot_end_w
+    x_range, y_range = (0, pitch_len), (0, pitch_wid)
+
+# Hover text (show original coords so you can sanity-check)
+hover_cols = [c for c in ["Start Side", "Start Zone", "Player", "Recipient player", "Outcome", "Pass height", "Match", "Date", "Minute", "Second"] if c in f.columns]
+
+def row_to_hover(row):
+    parts = []
+    for c in hover_cols:
+        v = row.get(c, "")
+        if pd.isna(v):
+            continue
+        parts.append(f"<b>{c}</b>: {v}")
+    parts.append(f"<b>Start</b>: ({row['Start X']:.1f}, {row['Start Y']:.1f})")
+    parts.append(f"<b>End</b>: ({row['End X']:.1f}, {row['End Y']:.1f})")
+    return "<br>".join(parts)
+
+hover_text = f.apply(row_to_hover, axis=1).to_list()
+
+
+# ----------------------------
 # Plot
-fig, ax = plt.subplots(figsize=(10, 6))
-draw_pitch(ax, show_grid=show_grid)
-plot_heatmap(ax, x, y, method=method, bins=bins)
+# ----------------------------
+with right:
+    st.subheader("Pitch map")
+    st.caption(f"Showing {len(f):,} crosses after filters.")
 
-ax.set_title(f"{team} — {player_label}\nCross start locations (n={len(p_df)})", fontsize=14)
+    fig = go.Figure()
 
-st.pyplot(fig, clear_figure=True)
+    if attack_up:
+        fig.update_layout(
+            xaxis=dict(range=x_range, showgrid=False, zeroline=False, visible=False, scaleanchor="y", scaleratio=1),
+            yaxis=dict(range=y_range, showgrid=False, zeroline=False, visible=False),
+            shapes=build_pitch_shapes_vertical(length=pitch_len, width=pitch_wid),
+            margin=dict(l=10, r=10, t=10, b=10),
+        )
+    else:
+        # Horizontal pitch shapes
+        shapes = []
+        shapes.append(dict(type="rect", x0=0, y0=0, x1=pitch_len, y1=pitch_wid, line=dict(width=2)))
+        shapes.append(dict(type="line", x0=pitch_len / 2, y0=0, x1=pitch_len / 2, y1=pitch_wid, line=dict(width=2)))
+        pa_x = 18
+        pa_y0, pa_y1 = 18, 62
+        shapes.append(dict(type="rect", x0=0, y0=pa_y0, x1=pa_x, y1=pa_y1, line=dict(width=2)))
+        shapes.append(dict(type="rect", x0=pitch_len - pa_x, y0=pa_y0, x1=pitch_len, y1=pa_y1, line=dict(width=2)))
+        sb_x = 6
+        sb_y0, sb_y1 = 30, 50
+        shapes.append(dict(type="rect", x0=0, y0=sb_y0, x1=sb_x, y1=sb_y1, line=dict(width=2)))
+        shapes.append(dict(type="rect", x0=pitch_len - sb_x, y0=sb_y0, x1=pitch_len, y1=sb_y1, line=dict(width=2)))
+        shapes.append(dict(type="circle", x0=pitch_len / 2 - 10, y0=pitch_wid / 2 - 10, x1=pitch_len / 2 + 10, y1=pitch_wid / 2 + 10, line=dict(width=2)))
+        fig.update_layout(
+            xaxis=dict(range=x_range, showgrid=False, zeroline=False, visible=False, scaleanchor="y", scaleratio=1),
+            yaxis=dict(range=y_range, showgrid=False, zeroline=False, visible=False),
+            shapes=shapes,
+            margin=dict(l=10, r=10, t=10, b=10),
+        )
 
-with st.expander("Show filtered data (crosses only)"):
-    st.dataframe(p_df.drop(columns=["_player_label"], errors="ignore"))
+    if show_zone_overlays:
+        add_zone_overlays(fig, attack_up=attack_up, flip_len=flip_direction, invert_width=invert_width)
+
+    # Split into success/fail traces so we can colour GREEN / RED
+    hover_arr = np.array(hover_text, dtype=object)
+    sx_s, sy_s, ex_s, ey_s = sx[success], sy[success], ex[success], ey[success]
+    sx_f, sy_f, ex_f, ey_f = sx[~success], sy[~success], ex[~success], ey[~success]
+
+    # Lines
+    if len(sx_s) > 0:
+        fig.add_trace(make_segment_trace(sx_s, sy_s, ex_s, ey_s, color="green"))
+    if len(sx_f) > 0:
+        fig.add_trace(make_segment_trace(sx_f, sy_f, ex_f, ey_f, color="red"))
+
+    # Start markers
+    if len(sx_s) > 0:
+        fig.add_trace(go.Scattergl(
+            x=sx_s, y=sy_s,
+            mode="markers",
+            marker=dict(size=7, opacity=0.85, color="green"),
+            hovertext=hover_arr[success],
+            hoverinfo="text",
+            showlegend=False
+        ))
+    if len(sx_f) > 0:
+        fig.add_trace(go.Scattergl(
+            x=sx_f, y=sy_f,
+            mode="markers",
+            marker=dict(size=7, opacity=0.85, color="red"),
+            hovertext=hover_arr[~success],
+            hoverinfo="text",
+            showlegend=False
+        ))
+
+    # Optional endpoints (neutral)
+    if show_endpoints and len(f) > 0:
+        fig.add_trace(go.Scattergl(
+            x=ex, y=ey,
+            mode="markers",
+            marker=dict(size=6, opacity=0.6, symbol="x"),
+            hoverinfo="skip",
+            showlegend=False
+        ))
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Metrics
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Crosses", f"{len(f):,}")
+    with m2:
+        st.metric("Completed", f"{int(success.sum()):,}")
+    with m3:
+        if "Distance" in f.columns and len(f) > 0:
+            st.metric("Avg distance", f"{f['Distance'].mean():.1f}")
+        else:
+            st.metric("Avg distance", "—")
+
+    # Table + download
+    if show_table:
+        st.subheader("Filtered data")
+        drop_cols = [c for c in ["_sx", "_sy", "_ex", "_ey", "_sy_plot", "_ey_plot"] if c in f.columns]
+        st.dataframe(f.drop(columns=drop_cols), use_container_width=True, height=350)
+
+    drop_cols = [c for c in ["_sx", "_sy", "_ex", "_ey", "_sy_plot", "_ey_plot"] if c in f.columns]
+    csv_out = f.drop(columns=drop_cols).to_csv(index=False).encode("utf-8")
+    st.download_button("Download filtered CSV", data=csv_out, file_name="filtered_crosses.csv", mime="text/csv")
