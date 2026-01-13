@@ -1,3 +1,23 @@
+# app.py
+# Streamlit app: crossing start-location heatmaps on a 105x68 pitch
+#
+# Run:
+#   pip install streamlit pandas numpy matplotlib scipy
+#   streamlit run app.py
+#
+# Notes:
+# - Cross events are identified by either:
+#     * boolean/int column `is_cross` == 1, OR
+#     * `action` containing "cross" (case-insensitive)
+# - Start locations are read from `start_adj_x`, `start_adj_y`
+# - AUTO coordinate handling:
+#     If data looks like a 52.5x34-centered system (roughly +/-52.5, +/-34),
+#     we apply Option 2 conversion:
+#         x_105 = start_adj_x + 52.5
+#         y_68  = 34 - start_adj_y
+#     Otherwise we assume it's already 0..105 / 0..68 and use as-is.
+# - Heatmap is drawn FIRST, then pitch lines are drawn ON TOP.
+#
 import streamlit as st
 import pandas as pd
 import numpy as np
