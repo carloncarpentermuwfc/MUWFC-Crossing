@@ -61,6 +61,8 @@ def classify_zone(start_x: float, start_y: float) -> str:
     """
     Start-zone classification (approximate to your diagram), using StatsBomb coords:
       X 0..120 (length), Y 0..80 (width)
+
+    NOTE: This is symmetric across width, so it still works whether width is inverted or not.
     """
     if start_x < 80:
         return "Other"
@@ -80,39 +82,49 @@ def classify_zone(start_x: float, start_y: float) -> str:
     return "Other"
 
 
-def add_zone_overlays(fig: go.Figure, attack_up: bool, flip_len: bool):
+def add_zone_overlays(fig: go.Figure, attack_up: bool, flip_len: bool, invert_width: bool):
     """
     Translucent start-zone overlays for visual reference.
 
-    IMPORTANT: When attack_up=True we plot x = 80 - Y, y = X,
-    so overlays must flip width too.
+    We draw in *plot coordinates*, which depend on:
+      - attack_up: vertical vs horizontal view
+      - flip_len: mirroring length (X)
+      - invert_width: mirroring width (Y)
     """
     def maybe_flip_x(x):
         return 120 - x if flip_len else x
+
+    def width_map(y):
+        # plot width coordinate
+        return 80 - y if invert_width else y
 
     def rect(xmin, xmax, ymin, ymax):
         x0, x1 = maybe_flip_x(xmin), maybe_flip_x(xmax)
         x_low, x_high = (min(x0, x1), max(x0, x1))
 
+        wy0 = width_map(ymin)
+        wy1 = width_map(ymax)
+        w_low, w_high = (min(wy0, wy1), max(wy0, wy1))
+
         if attack_up:
-            # plot coords: x = 80 - Y, y = X
+            # plot coords: x = width_map(Y), y = X
             return dict(
                 type="rect",
-                x0=80 - ymax,
-                x1=80 - ymin,
+                x0=w_low,
+                x1=w_high,
                 y0=x_low,
                 y1=x_high,
                 line=dict(width=1, dash="dot"),
                 opacity=0.15,
             )
         else:
-            # plot coords: x = X, y = Y
+            # plot coords: x = X, y = width_map(Y)
             return dict(
                 type="rect",
                 x0=x_low,
                 x1=x_high,
-                y0=ymin,
-                y1=ymax,
+                y0=w_low,
+                y1=w_high,
                 line=dict(width=1, dash="dot"),
                 opacity=0.15,
             )
@@ -134,7 +146,7 @@ def add_zone_overlays(fig: go.Figure, attack_up: bool, flip_len: bool):
 # ----------------------------
 # App
 # ----------------------------
-st.title("Crossing Dashboard (Zones + Start Side + End Filters)")
+st.title("Crossing Dashboard (Rechecked Coords + Width Fix)")
 
 left, right = st.columns([1, 2], vertical_alignment="top")
 
@@ -197,10 +209,18 @@ with left:
     st.subheader("View options")
     attack_up = st.toggle("Attack upwards (rotate pitch)", value=True)
     flip_direction = st.toggle(
-        "Flip direction",
+        "Flip direction (length)",
         value=False,
-        help="Mirrors pitch length (X) so zones/filters match what you see.",
+        help="Mirrors pitch length (X). Use if the team is attacking the opposite end in your data.",
     )
+
+    # NEW: width inversion toggle (this fixes “some crosses look flipped”)
+    invert_width = st.toggle(
+        "Invert width (fix left/right)",
+        value=True,
+        help="If crosses appear on the wrong side of the pitch, toggle this.",
+    )
+
     show_zone_overlays = st.toggle("Show start-zone overlays", value=True)
     show_endpoints = st.toggle("Show endpoints", value=False)
     show_table = st.toggle("Show data table", value=True)
@@ -214,7 +234,7 @@ with left:
         default=["Diagonals", "Whipped", "Driven", "Cutbacks & stand ups"],
     )
 
-    # Start side filter (based on Start Y)
+    # Start side filter (computed from what you SEE on screen, not raw Y)
     st.subheader("Start side filter")
     side_choice = st.radio("Crosses delivered from", ["Both", "Left", "Right"], index=0, horizontal=True)
 
@@ -254,9 +274,6 @@ if selected_players is not None and "Player" in f.columns:
 
 f = f.dropna(subset=["Start X", "Start Y", "End X", "End Y"]).copy()
 
-# Start side (use RAW Start Y so it's stable regardless of plotting rotation)
-f["Start Side"] = np.where(f["Start Y"].to_numpy() < 40, "Left", "Right")
-
 # Flip length for plotting + zone assignment if requested
 if flip_direction:
     f["_sx"] = 120 - f["Start X"]
@@ -268,7 +285,14 @@ else:
 f["_sy"] = f["Start Y"]
 f["_ey"] = f["End Y"]
 
-# Start zone assignment (based on START only)
+# Width mapping for plotting and for “left/right” filter
+def width_map(arr):
+    return 80 - arr if invert_width else arr
+
+f["_sy_plot"] = width_map(f["_sy"].to_numpy())
+f["_ey_plot"] = width_map(f["_ey"].to_numpy())
+
+# Start zone assignment (uses START in length-flipped coords; width inversion doesn't matter for these symmetric rules)
 f["Start Zone"] = [
     classify_zone(x, y) for x, y in zip(f["_sx"].to_numpy(), f["_sy"].to_numpy())
 ]
@@ -279,18 +303,22 @@ if selected_zones:
 else:
     f = f.iloc[0:0]
 
+# Start side assignment based on what you see (after width_map)
+# Left side = x < 40 in plot-width space
+f["Start Side"] = np.where(width_map(f["Start Y"].to_numpy()) < 40, "Left", "Right")
+
 # Apply start side filter
 if side_choice != "Both":
     f = f[f["Start Side"] == side_choice]
 
-# Apply end location filter (based on END in the same plotted orientation as _ex/_ey)
+# Apply end location filter (in length-flipped coords; width inversion applied via raw _ey later)
 if use_end_filters and len(f) > 0:
+    # We filter on the “data coordinate frame” (after length flip, before width inversion)
     f = f[
         (f["_ex"].between(end_x_range[0], end_x_range[1]))
         & (f["_ey"].between(end_y_range[0], end_y_range[1]))
     ]
     if in_box_only:
-        # penalty area at attacking end: X >= 102 and Y between 18 and 62
         f = f[(f["_ex"] >= 102) & (f["_ey"].between(18, 62))]
 
 # Success flag
@@ -301,29 +329,27 @@ else:
 
 # ----------------------------
 # Coordinates for plotting
-# IMPORTANT FIX:
-# When attack_up=True we plot x = 80 - Y, y = X
-# so left/right stays consistent.
+# - attack_up: x = width_map(Y), y = X
+# - else:      x = X, y = width_map(Y)
 # ----------------------------
 pitch_len, pitch_wid = 120, 80
 
 plot_start_x = f["_sx"].to_numpy()
-plot_start_y = f["_sy"].to_numpy()
 plot_end_x = f["_ex"].to_numpy()
-plot_end_y = f["_ey"].to_numpy()
+
+plot_start_w = width_map(f["_sy"].to_numpy())
+plot_end_w = width_map(f["_ey"].to_numpy())
 
 if attack_up:
-    sx = pitch_wid - plot_start_y
-    sy = plot_start_x
-    ex = pitch_wid - plot_end_y
-    ey = plot_end_x
+    sx, sy = plot_start_w, plot_start_x
+    ex, ey = plot_end_w, plot_end_x
     x_range, y_range = (0, pitch_wid), (0, pitch_len)
 else:
-    sx, sy = plot_start_x, plot_start_y
-    ex, ey = plot_end_x, plot_end_y
+    sx, sy = plot_start_x, plot_start_w
+    ex, ey = plot_end_x, plot_end_w
     x_range, y_range = (0, pitch_len), (0, pitch_wid)
 
-# Hover text
+# Hover text (show original coords so you can sanity-check)
 hover_cols = [c for c in ["Start Side", "Start Zone", "Player", "Recipient player", "Outcome", "Pass height", "Match", "Date", "Minute", "Second"] if c in f.columns]
 
 def row_to_hover(row):
@@ -357,6 +383,7 @@ with right:
             margin=dict(l=10, r=10, t=10, b=10),
         )
     else:
+        # Horizontal pitch shapes
         shapes = []
         shapes.append(dict(type="rect", x0=0, y0=0, x1=pitch_len, y1=pitch_wid, line=dict(width=2)))
         shapes.append(dict(type="line", x0=pitch_len / 2, y0=0, x1=pitch_len / 2, y1=pitch_wid, line=dict(width=2)))
@@ -377,7 +404,7 @@ with right:
         )
 
     if show_zone_overlays:
-        add_zone_overlays(fig, attack_up=attack_up, flip_len=flip_direction)
+        add_zone_overlays(fig, attack_up=attack_up, flip_len=flip_direction, invert_width=invert_width)
 
     # Split into success/fail traces so we can colour GREEN / RED
     hover_arr = np.array(hover_text, dtype=object)
@@ -437,10 +464,9 @@ with right:
     # Table + download
     if show_table:
         st.subheader("Filtered data")
-        drop_cols = [c for c in ["_sx", "_sy", "_ex", "_ey"] if c in f.columns]
+        drop_cols = [c for c in ["_sx", "_sy", "_ex", "_ey", "_sy_plot", "_ey_plot"] if c in f.columns]
         st.dataframe(f.drop(columns=drop_cols), use_container_width=True, height=350)
 
-    drop_cols = [c for c in ["_sx", "_sy", "_ex", "_ey"] if c in f.columns]
+    drop_cols = [c for c in ["_sx", "_sy", "_ex", "_ey", "_sy_plot", "_ey_plot"] if c in f.columns]
     csv_out = f.drop(columns=drop_cols).to_csv(index=False).encode("utf-8")
     st.download_button("Download filtered CSV", data=csv_out, file_name="filtered_crosses.csv", mime="text/csv")
-
